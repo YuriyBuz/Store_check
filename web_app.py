@@ -81,8 +81,14 @@ def load_config_from_gsheet(url):
             
         df = pd.read_csv(csv_url)
         
-        # Видаляємо випадкові пробіли в назвах колонок (наприклад, 'TC ' -> 'TC')
-        df.columns = df.columns.str.strip()
+        # ВИПРАВЛЕННЯ КИРИЛИЦІ: 
+        # Замінюємо українські літери Т, С, М на англійські T, C, M, щоб уникнути конфліктів розкладки
+        df.columns = (
+            df.columns.str.strip()
+            .str.replace('Т', 'T')
+            .str.replace('С', 'C')
+            .str.replace('М', 'M')
+        )
         
         # Перевірка чи завантажилась правильна таблиця
         if 'TC' not in df.columns:
@@ -111,12 +117,12 @@ with st.sidebar:
         
     # Витягуємо унікальні мережі та бренди з колонок, ігноруючи порожні рядки
     stores_from_sheet = [s.strip() for s in gsheet_df['TC'].unique() if str(s).strip()]
-    brands_from_sheet = [b.strip() for b in gsheet_df['ТМ'].unique() if str(b).strip()]
+    brands_from_sheet = [b.strip() for b in gsheet_df['TM'].unique() if str(b).strip()]
     
     # Створюємо словник Бренд -> Категорія для формування точного пошуку
     brand_category_map = {}
     for _, row in gsheet_df.iterrows():
-        b = str(row.get('ТМ', '')).strip()
+        b = str(row.get('TM', '')).strip()
         # Використовуємо strip для назви колонки категорії
         c = str(row.get('котегорія продукту', '')).strip() 
         if b and b not in brand_category_map:
