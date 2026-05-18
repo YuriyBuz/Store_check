@@ -1,0 +1,21 @@
+КЕШ PYTHON
+
+pycache/
+*.py[cod]
+*$py.class
+
+ВІРТУАЛЬНІ СЕРЕДОВИЩА
+
+.venv/
+venv/
+env/
+ENV/
+
+ЗГЕНЕРОВАНІ ЗВІТИ EXCEL
+
+*.xlsx
+*.xls
+
+НАЛАШТУВАННЯ STREAMLIT (якщо є)
+
+.streamlit/secrets.toml
