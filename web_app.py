@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import requests
-import random
 import re
 from io import BytesIO
 from datetime import datetime
@@ -15,8 +14,9 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/16OIt-2jMpLGehrYGEcv9_QpEfzv
 
 sys.path.insert(0, str(Path(__file__).parent))
 from scrape_brands import (
-    scrape_silpo, scrape_novus, scrape_varus, node_available,
-    write_store_sheet, write_summary_sheet, check_data_quality,
+    scrape_silpo, scrape_novus, scrape_varus,
+    scrape_epicenter, scrape_eva, scrape_organic,
+    node_available, write_store_sheet, write_summary_sheet, check_data_quality,
 )
 
 st.set_page_config(
@@ -69,9 +69,8 @@ def to_df(products):
 
 @st.cache_data(ttl=600)
 def load_config_from_gsheet(url):
-    """Завантажує налаштування мереж та брендів з Google Таблиці. Кешується на 10 хвилин."""
+    """Завантажує налаштування мереж та брендів з Google Таблиці."""
     try:
-        # Надійне формування посилання для експорту CSV, витягуємо ID документу
         doc_id_match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
         if doc_id_match:
             doc_id = doc_id_match.group(1)
@@ -81,8 +80,7 @@ def load_config_from_gsheet(url):
             
         df = pd.read_csv(csv_url)
         
-        # ВИПРАВЛЕННЯ КИРИЛИЦІ: 
-        # Замінюємо українські літери Т, С, М на англійські T, C, M, щоб уникнути конфліктів розкладки
+        # ВИПРАВЛЕННЯ КИРИЛИЦІ
         df.columns = (
             df.columns.str.strip()
             .str.replace('Т', 'T')
@@ -90,13 +88,12 @@ def load_config_from_gsheet(url):
             .str.replace('М', 'M')
         )
         
-        # Перевірка чи завантажилась правильна таблиця
         if 'TC' not in df.columns:
             st.error(f"❌ Помилка: Не знайдено колонку 'TC'. Знайдені колонки: `{list(df.columns)}`")
-            st.info("💡 **Підказка:** Можливо, ваша Google Таблиця закрита. Відкрийте таблицю -> Натисніть 'Поділитися' -> Змініть доступ на **'Усі, хто має посилання' (Anyone with the link)**.")
+            st.info("💡 Можливо, ваша Google Таблиця закрита. Відкрийте доступ.")
             return pd.DataFrame()
 
-        df = df.fillna("") # Замінюємо порожні значення
+        df = df.fillna("") 
         return df
     except Exception as e:
         st.error(f"Помилка завантаження таблиці: {e}")
@@ -108,29 +105,23 @@ with st.sidebar:
     st.title("🛒 Моніторинг Залишків")
     st.caption("Автоматична перевірка наявності та цін товарів у супермаркетах")
     
-    # Завантажуємо дані з Google Таблиці
     gsheet_df = load_config_from_gsheet(SHEET_URL)
     
     if gsheet_df.empty:
-        # Зупиняємо виконання, помилка вже виведена у функції вище
         st.stop()
         
-    # Витягуємо унікальні мережі та бренди з колонок, ігноруючи порожні рядки
     stores_from_sheet = [s.strip() for s in gsheet_df['TC'].unique() if str(s).strip()]
     brands_from_sheet = [b.strip() for b in gsheet_df['TM'].unique() if str(b).strip()]
     
-    # Створюємо словник Бренд -> Категорія для формування точного пошуку
     brand_category_map = {}
     for _, row in gsheet_df.iterrows():
         b = str(row.get('TM', '')).strip()
-        # Використовуємо strip для назви колонки категорії
         c = str(row.get('котегорія продукту', '')).strip() 
         if b and b not in brand_category_map:
             brand_category_map[b] = c
 
     st.divider()
     st.subheader("1. Оберіть мережі")
-    st.caption("Мережі завантажено з Google Таблиці")
     
     selected_stores = []
     for store in stores_from_sheet:
@@ -139,21 +130,16 @@ with st.sidebar:
 
     st.divider()
     st.subheader("2. Бренд та Категорія")
-    st.caption("Бренди завантажено з Google Таблиці")
 
     selected_brand = st.selectbox(
         label="Бренд (ТМ):",
         options=brands_from_sheet,
     )
 
-    # Автоматично підтягуємо категорію з таблиці для обраного бренду
     auto_category = brand_category_map.get(selected_brand, "")
     if auto_category:
         st.info(f"Категорія з таблиці: **{auto_category}**")
         
-    # Формуємо фінальний пошуковий запит
-    # ВАЖЛИВО: Сайти погано реагують на складні запити типу "Соус Bonsai". 
-    # Тому ми шукаємо лише за назвою бренду (як реальні користувачі).
     search_query = selected_brand
 
     st.divider()
@@ -165,9 +151,8 @@ st.title("Моніторинг Залишків та Цін")
 
 if not go:
     st.info(
-        "👈 Оберіть мережі та бренд у бічній панелі (всі налаштування підтягнуто з вашої онлайн-таблиці), "
-        "а потім натисніть **Знайти товари**.\n\n"
-        "Інструмент просканує сайти обраних супермаркетів і покаже актуальні ціни, знижки та наявність товарів."
+        "👈 Оберіть мережі та бренд у бічній панелі, "
+        "а потім натисніть **Знайти товари**."
     )
     st.stop()
 
@@ -194,13 +179,19 @@ for store in selected_stores:
         meta = {}
         store_lower = store.lower()
         
-        # Гнучка перевірка імені мережі, щоб уникнути проблем типу "Сильпо" vs "Сільпо"
+        # ── РОЗУМНИЙ РОЗПОДІЛ ПАРСЕРІВ ──
         if "сільпо" in store_lower or "сильпо" in store_lower:
             products = scrape_silpo(search_query, session, has_node, log_fn=st.write, meta=meta)
-        elif "novus" in store_lower:
+        elif "novus" in store_lower or "новус" in store_lower:
             products = scrape_novus(search_query, session, log_fn=st.write, meta=meta)
-        elif "varus" in store_lower:
+        elif "varus" in store_lower or "варус" in store_lower:
             products = scrape_varus(search_query, session, log_fn=st.write, meta=meta)
+        elif "епіцентр" in store_lower or "epicenter" in store_lower:
+            products = scrape_epicenter(search_query, session, has_node, log_fn=st.write, meta=meta)
+        elif "eva" in store_lower or "єва" in store_lower:
+            products = scrape_eva(search_query, session, log_fn=st.write, meta=meta)
+        elif "organic" in store_lower or "органік" in store_lower:
+            products = scrape_organic(search_query, session, log_fn=st.write, meta=meta)
         else:
             st.warning(f"Мережа '{store}' є в таблиці, але для неї ще не підключено алгоритм сканування.")
             products = []
@@ -273,7 +264,6 @@ for i, store in enumerate(stores_with_data):
     with tabs[i]:
         df = to_df(results[store])
 
-        # Фільтри для таблиці
         col_search, col_stock, col_disc = st.columns([3, 1, 1])
         with col_search:
             search_text = st.text_input(
