@@ -11,9 +11,16 @@ import time
 import json
 import re
 import sys
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import cloudscraper
+except ImportError:
+    print("ERROR: Missing package cloudscraper.")
+    sys.exit(1)
 
 try:
     from bs4 import BeautifulSoup
@@ -67,20 +74,29 @@ C_DISCOUNT  = "FFEDD5"
 # ─────────────────────────────────────────────────────────
 
 def fetch(url, session):
-    """Оригінальна функція fetch з обробкою помилок"""
+    """Оригінальна функція fetch з обробкою помилок та обходом Cloudflare (403 Forbidden)"""
     try:
-        r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+        # Використовуємо cloudscraper замість звичайного requests для обходу захисту сайтів
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
+        r = scraper.get(url, timeout=30, allow_redirects=True)
+        
         # Додаємо обхід простого блокування, як було в Organic Market
         if len(r.text) < 2000 and "challenge_passed" in r.text:
             m = re.search(r'defaultHash\s*=\s*"([a-f0-9]+)"', r.text)
             if m:
-                session.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
-                r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+                scraper.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
+                r = scraper.get(url, timeout=30, allow_redirects=True)
                 
         r.raise_for_status()
         r.encoding = 'utf-8'
         return BeautifulSoup(r.text, "html.parser"), r.text
-    except requests.RequestException as e:
+    except Exception as e:
         return None, str(e)
 
 def _node_cmd():
@@ -304,7 +320,7 @@ def scrape_varus(query, session, log_fn=print, meta=None):
     return scrape_zakaz("varus", query, session, log_fn, meta)
 
 # ─────────────────────────────────────────────────────────
-#  ЕКСПОРТ (Як було у вас)
+#  ЕКСПОРТ
 # ─────────────────────────────────────────────────────────
 
 def check_data_quality(products):
