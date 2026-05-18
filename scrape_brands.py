@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
 Скрипт для моніторингу залишків (Сільпо, Novus, Varus)
-Використовує рекурсивний пошук по JSON та розшифровку Nuxt 3 / Next.js
-(рішення адаптоване з оригінального файлу для обходу блокувань).
+Повністю побудований на оригінальній архітектурі (Node.js Nuxt Decoder, Fetch Wrapper)
 """
 
-import re
+import math
 import requests
+import subprocess
+import time
 import json
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from bs4 import BeautifulSoup
+from pathlib import Path
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("ERROR: Missing package bs4.")
+    sys.exit(1)
 
 try:
     import openpyxl
@@ -19,15 +29,17 @@ except ImportError:
     pass
 
 # ─────────────────────────────────────────────────────────
-#  КОНСТАНТИ
+#  НАЛАШТУВАННЯ ТА СТИЛІ
 # ─────────────────────────────────────────────────────────
+MAX_PAGES = 10
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.6",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 }
 
@@ -51,14 +63,63 @@ C_TITLE     = "047857"
 C_DISCOUNT  = "FFEDD5"
 
 # ─────────────────────────────────────────────────────────
-#  ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ JSON / NUXT 3
+#  ОРИГІНАЛЬНІ ФУНКЦІЇ З ВАШОГО КОДУ (Node.js, Fetch, Bypass)
 # ─────────────────────────────────────────────────────────
 
+def fetch(url, session):
+    """Оригінальна функція fetch з обробкою помилок"""
+    try:
+        r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+        # Додаємо обхід простого блокування, як було в Organic Market
+        if len(r.text) < 2000 and "challenge_passed" in r.text:
+            m = re.search(r'defaultHash\s*=\s*"([a-f0-9]+)"', r.text)
+            if m:
+                session.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
+                r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+                
+        r.raise_for_status()
+        r.encoding = 'utf-8'
+        return BeautifulSoup(r.text, "html.parser"), r.text
+    except requests.RequestException as e:
+        return None, str(e)
+
+def _node_cmd():
+    for cmd in ("node", "nodejs"):
+        try:
+            if subprocess.run([cmd, "--version"], capture_output=True, timeout=5).returncode == 0:
+                return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    return None
+
 def node_available():
-    return True # Більше не потребуємо зовнішнього Node.js, розшифровуємо нативно!
+    return _node_cmd() is not None
+
+def decode_nuxt(script_text, log_fn=print):
+    """Оригінальний декодер Nuxt через Node.js"""
+    import tempfile, os
+    cmd = _node_cmd()
+    if not cmd:
+        return None
+    js = "const window={};\n" + script_text + "\nprocess.stdout.write(JSON.stringify(window.__NUXT__||null));"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(js)
+            tmp = f.name
+        result = subprocess.run([cmd, tmp], capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout)
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except OSError: pass
+    return None
 
 def _resolve_nuxt(arr, idx, depth=0):
-    """Дешифратор масивів Nuxt 3 (Точно як було у вашому оригінальному коді для Eva)"""
+    """Оригінальний дереференсер для Nuxt 3 масивів (як у Eva)"""
     if depth > 30 or not isinstance(idx, int) or idx < 0 or idx >= len(arr):
         return None
     val = arr[idx]
@@ -70,31 +131,106 @@ def _resolve_nuxt(arr, idx, depth=0):
         return [_resolve_nuxt(arr, v, depth + 1) if isinstance(v, int) else v for v in val]
     return val
 
-def recursive_find_products(node, found_dict, store_type):
-    """Шукає товари, зариті глибоко в дереві JSON (Next.js / Nuxt 3)"""
+# Універсальний пошук товарів у будь-якому складному JSON
+def extract_products_from_json(node, found_products):
     if isinstance(node, dict):
-        if store_type == "zakaz":
-            # Формат Zakaz.ua (Novus / Varus)
-            if "ean" in node and "title" in node and "price" in node:
-                ean = str(node.get("ean") or node.get("id") or "")
-                if ean and ean not in found_dict:
-                    found_dict[ean] = node
-        elif store_type == "silpo":
-            # Формат Сільпо
-            if "title" in node and "price" in node and "slug" in node:
-                sku = str(node.get("id") or node.get("sku") or node.get("slug") or "")
-                if sku and sku not in found_dict:
-                    found_dict[sku] = node
-                    
+        # Ознаки товару: є ціна і назва
+        if "price" in node and ("title" in node or "name" in node or "name_ua" in node):
+            if "sku" in node or "id" in node or "ean" in node or "slug" in node:
+                # Уникаємо додавання дублікатів
+                sku = str(node.get("id") or node.get("sku") or node.get("ean") or node.get("slug") or "")
+                if sku and sku not in found_products:
+                    found_products[sku] = node
         for v in node.values():
-            recursive_find_products(v, found_dict, store_type)
-            
+            extract_products_from_json(v, found_products)
     elif isinstance(node, list):
         for v in node:
-            recursive_find_products(v, found_dict, store_type)
+            extract_products_from_json(v, found_products)
 
 # ─────────────────────────────────────────────────────────
-#  ZAKAZ.UA SCRAPER (NOVUS / VARUS)
+#  ПАРСЕР СІЛЬПО (Використовує Node.js + _resolve_nuxt)
+# ─────────────────────────────────────────────────────────
+
+def scrape_silpo(query, session, has_node, log_fn=print, meta=None):
+    if not has_node:
+        log_fn("  Сільпо: Node.js не знайдено! Парсинг може бути неповним.")
+
+    log_fn(f"Сільпо: шукаємо '{query}'...")
+    query_enc = requests.utils.quote(query)
+    
+    # Спробуємо два різні ендпоінти, які використовує Сільпо
+    urls_to_try = [
+        f"https://silpo.ua/search?find={query_enc}",
+        f"https://silpo.ua/catalog/search?search={query_enc}"
+    ]
+    
+    products_data = {}
+    
+    for url in urls_to_try:
+        soup, raw_text = fetch(url, session)
+        if not soup:
+            log_fn(f"  Сільпо: Помилка доступу до {url} ({raw_text})")
+            continue
+            
+        # Спосіб 1: Шукаємо Nuxt 3 дані (як у Eva)
+        tag = soup.find("script", id="__NUXT_DATA__")
+        if tag:
+            try:
+                arr = json.loads(tag.string)
+                resolved = [_resolve_nuxt(arr, i) for i in range(min(15, len(arr)))]
+                extract_products_from_json(resolved, products_data)
+            except Exception as e:
+                log_fn(f"  Сільпо: Помилка __NUXT_DATA__ - {e}")
+                
+        # Спосіб 2: Якщо сайт віддав класичний Nuxt 2 (через Node.js)
+        for script in soup.find_all("script"):
+            txt = script.string or ""
+            if "window.__NUXT__" in txt:
+                nuxt_data = decode_nuxt(txt, log_fn)
+                if nuxt_data:
+                    extract_products_from_json(nuxt_data, products_data)
+
+        # Спосіб 3: Прямий парсинг HTML карток, якщо JSON заблоковано
+        for card in soup.select('.product-card, li[data-product-id]'):
+            name_el = card.select_one('.product-title, .name')
+            if not name_el: continue
+            
+            sku = card.get('data-product-id') or ""
+            price_el = card.select_one('.product-price__current, .price')
+            price_txt = price_el.text if price_el else "0"
+            price = float(re.sub(r'[^\d.]', '', price_txt.replace(',', '.')) or 0)
+            
+            if sku and sku not in products_data:
+                products_data[sku] = {"title": name_el.text.strip(), "price": price, "slug": sku, "html_parsed": True}
+
+    # Форматуємо знайдені товари
+    final_products = []
+    for p in products_data.values():
+        name = p.get("title") or p.get("name") or p.get("name_ua") or ""
+        sku = str(p.get("id") or p.get("sku") or p.get("slug") or p.get("ean") or "")
+        
+        price = float(p.get("price", 0))
+        old_price = float(p.get("oldPrice") or p.get("old_price") or p.get("price_old") or 0)
+        
+        on_discount = old_price > price
+        reg_price = old_price if on_discount else price
+        disc_price = price if on_discount else 0
+        
+        in_stock = str(p.get("status")) != "out_of_stock"
+        url_p = f"https://silpo.ua/product/{p.get('slug')}" if p.get("slug") else f"https://silpo.ua/search?find={query_enc}"
+        
+        final_products.append({
+            "name": name, "sku": sku,
+            "price": str(reg_price), "on_discount": on_discount,
+            "discount_price": str(disc_price) if on_discount else "",
+            "url": url_p, "in_stock": in_stock, "seller": "Сільпо"
+        })
+
+    log_fn(f"  Сільпо: знайдено {len(final_products)} товарів.")
+    return final_products
+
+# ─────────────────────────────────────────────────────────
+#  ПАРСЕР ZAKAZ (NOVUS / VARUS)
 # ─────────────────────────────────────────────────────────
 
 def scrape_zakaz(retailer, query, session, log_fn=print, meta=None):
@@ -102,51 +238,64 @@ def scrape_zakaz(retailer, query, session, log_fn=print, meta=None):
     query_enc = requests.utils.quote(query)
     base_url = f"https://{retailer}.zakaz.ua/uk/search/?q={query_enc}"
     
-    try:
-        r = session.get(base_url, headers=REQUEST_HEADERS, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        log_fn(f"  {retailer.title()}: Помилка завантаження сторінки.")
+    soup, raw_text = fetch(base_url, session)
+    if not soup:
+        log_fn(f"  {retailer.title()}: Помилка завантаження сторінки ({raw_text})")
         return []
         
-    script = soup.find("script", id="__NEXT_DATA__")
-    products = []
+    products_data = {}
     
+    # Zakaz використовує Next.js
+    script = soup.find("script", id="__NEXT_DATA__")
     if script:
         try:
             data = json.loads(script.string)
-            found_dict = {}
-            # Шукаємо всі об'єкти, що схожі на товари в JSON
-            recursive_find_products(data, found_dict, "zakaz")
-            
-            for p in found_dict.values():
-                name = p.get("title") or p.get("name") or ""
-                sku = str(p.get("ean") or p.get("id") or "")
-                
-                price_raw = float(p.get("price", 0))
-                if price_raw > 1000: price_raw = price_raw / 100.0
-                
-                old_price_raw = float(p.get("old_price") or p.get("discount_price") or 0)
-                if old_price_raw > 1000: old_price_raw = old_price_raw / 100.0
-                
-                on_discount = bool(old_price_raw and old_price_raw > price_raw)
-                reg_price = old_price_raw if on_discount else price_raw
-                disc_price = price_raw if on_discount else 0
-                
-                in_stock = p.get("in_stock", True)
-                url_p = f"https://{retailer}.zakaz.ua/uk/products/{sku}/" if sku else base_url
-                
-                products.append({
-                    "name": name, "sku": sku,
-                    "price": str(reg_price), "on_discount": on_discount,
-                    "discount_price": str(disc_price) if on_discount else "",
-                    "url": url_p, "in_stock": in_stock, "seller": retailer.title()
-                })
+            extract_products_from_json(data, products_data)
         except Exception as e:
             log_fn(f"  {retailer.title()}: Помилка розбору JSON: {e}")
             
-    log_fn(f"  {retailer.title()}: знайдено {len(products)} товарів.")
-    return products
+    # Fallback: HTML парсинг
+    if not products_data:
+        for card in soup.select('[data-testid="product-tile"]'):
+            name_el = card.select_one('[data-testid="product-tile-title"]')
+            if not name_el: continue
+            
+            price_el = card.select_one('[data-testid="product-tile-price"]')
+            price_txt = price_el.text if price_el else "0"
+            price = float(re.sub(r'[^\d.]', '', price_txt.replace(',', '.')) or 0)
+            
+            name = name_el.text.strip()
+            if name not in products_data:
+                products_data[name] = {"title": name, "price": price * 100} # Закладаємо формат копійок
+
+    final_products = []
+    for p in products_data.values():
+        name = p.get("title") or p.get("name") or ""
+        sku = str(p.get("ean") or p.get("id") or "")
+        
+        # Ціни в Zakaz часто в копійках
+        price_raw = float(p.get("price", 0))
+        if price_raw > 1000: price_raw = price_raw / 100.0
+        
+        old_price_raw = float(p.get("old_price") or p.get("discount_price") or 0)
+        if old_price_raw > 1000: old_price_raw = old_price_raw / 100.0
+        
+        on_discount = bool(old_price_raw and old_price_raw > price_raw)
+        reg_price = old_price_raw if on_discount else price_raw
+        disc_price = price_raw if on_discount else 0
+        
+        in_stock = p.get("in_stock", True)
+        url_p = f"https://{retailer}.zakaz.ua/uk/products/{sku}/" if sku else base_url
+        
+        final_products.append({
+            "name": name, "sku": sku,
+            "price": str(reg_price), "on_discount": on_discount,
+            "discount_price": str(disc_price) if on_discount else "",
+            "url": url_p, "in_stock": in_stock, "seller": retailer.title()
+        })
+            
+    log_fn(f"  {retailer.title()}: знайдено {len(final_products)} товарів.")
+    return final_products
 
 def scrape_novus(query, session, log_fn=print, meta=None):
     return scrape_zakaz("novus", query, session, log_fn, meta)
@@ -154,64 +303,8 @@ def scrape_novus(query, session, log_fn=print, meta=None):
 def scrape_varus(query, session, log_fn=print, meta=None):
     return scrape_zakaz("varus", query, session, log_fn, meta)
 
-
 # ─────────────────────────────────────────────────────────
-#  СІЛЬПО SCRAPER (NUXT 3)
-# ─────────────────────────────────────────────────────────
-
-def scrape_silpo(query, session, has_node, log_fn=print, meta=None):
-    log_fn(f"Сільпо: шукаємо '{query}'...")
-    query_enc = requests.utils.quote(query)
-    url = f"https://silpo.ua/search?find={query_enc}"
-    
-    try:
-        r = session.get(url, headers=REQUEST_HEADERS, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        log_fn("  Сільпо: Помилка завантаження сторінки.")
-        return []
-        
-    products = []
-    
-    # Сільпо використовує Nuxt 3 (як і Eva), дані лежать в <script id="__NUXT_DATA__">
-    tag = soup.find("script", id="__NUXT_DATA__")
-    if tag:
-        try:
-            arr = json.loads(tag.string)
-            # Розшифровуємо дерево за алгоритмом з вашого файлу
-            resolved = [_resolve_nuxt(arr, i) for i in range(min(15, len(arr)))]
-            
-            found_dict = {}
-            recursive_find_products(resolved, found_dict, "silpo")
-            
-            for p in found_dict.values():
-                name = p.get("title") or ""
-                sku = str(p.get("id") or p.get("sku") or p.get("slug") or "")
-                
-                price = float(p.get("price") or 0)
-                old_price = float(p.get("oldPrice") or 0)
-                
-                on_discount = old_price > price
-                reg_price = old_price if on_discount else price
-                disc_price = price if on_discount else 0
-                
-                in_stock = str(p.get("status")) != "out_of_stock"
-                url_p = f"https://silpo.ua/product/{p.get('slug')}" if p.get("slug") else url
-                
-                products.append({
-                    "name": name, "sku": sku,
-                    "price": str(reg_price), "on_discount": on_discount,
-                    "discount_price": str(disc_price) if on_discount else "",
-                    "url": url_p, "in_stock": in_stock, "seller": "Сільпо"
-                })
-        except Exception as e:
-            log_fn(f"  Сільпо: Помилка розбору JSON: {e}")
-            
-    log_fn(f"  Сільпо: знайдено {len(products)} товарів.")
-    return products
-
-# ─────────────────────────────────────────────────────────
-#  ФУНКЦІЇ ЕКСПОРТУ В EXCEL
+#  ЕКСПОРТ (Як було у вас)
 # ─────────────────────────────────────────────────────────
 
 def check_data_quality(products):
