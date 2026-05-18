@@ -70,14 +70,26 @@ C_DISCOUNT  = "FFEDD5"
 def fetch(url, session):
     try:
         if 'cloudscraper' in sys.modules:
-            scraper = cloudscraper.create_scraper()
-            r = scraper.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+            scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+            r = scraper.get(url, timeout=30, allow_redirects=True)
         else:
-             r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+             r = session.get(url, headers=REQUEST_HEADERS, timeout=30, allow_redirects=True)
+             
+        # Оригінальний обхід перевірки (Organic Market)
+        if len(r.text) < 2000 and "challenge_passed" in r.text:
+            m = re.search(r'defaultHash\s*=\s*"([a-f0-9]+)"', r.text)
+            if m:
+                if 'cloudscraper' in sys.modules:
+                    scraper.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
+                    r = scraper.get(url, timeout=30, allow_redirects=True)
+                else:
+                    session.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
+                    r = session.get(url, headers=REQUEST_HEADERS, timeout=30, allow_redirects=True)
+                    
         r.raise_for_status()
         r.encoding = 'utf-8'
         return BeautifulSoup(r.text, "html.parser"), r.text
-    except requests.RequestException as e:
+    except Exception as e:
         return None, str(e)
 
 def _node_cmd():
