@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Скрипт для моніторингу залишків (Сільпо, Novus, Varus)
-Повністю побудований на оригінальній архітектурі (Node.js Nuxt Decoder, Fetch Wrapper)
+Універсальний парсер (Епіцентр, Eva, Organic Market, Сільпо, Novus, Varus)
+Містить ОРИГІНАЛЬНІ алгоритми з вашого файлу + нові.
 """
 
 import math
@@ -15,18 +15,12 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 try:
     import cloudscraper
 except ImportError:
-    print("ERROR: Missing package cloudscraper.")
-    sys.exit(1)
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("ERROR: Missing package bs4.")
-    sys.exit(1)
+    pass
 
 try:
     import openpyxl
@@ -70,33 +64,20 @@ C_TITLE     = "047857"
 C_DISCOUNT  = "FFEDD5"
 
 # ─────────────────────────────────────────────────────────
-#  ОРИГІНАЛЬНІ ФУНКЦІЇ З ВАШОГО КОДУ (Node.js, Fetch, Bypass)
+#  ОРИГІНАЛЬНІ БАЗОВІ ФУНКЦІЇ З ВАШОГО КОДУ
 # ─────────────────────────────────────────────────────────
 
 def fetch(url, session):
-    """Оригінальна функція fetch з обробкою помилок та обходом Cloudflare (403 Forbidden)"""
     try:
-        # Використовуємо cloudscraper замість звичайного requests для обходу захисту сайтів
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
-        r = scraper.get(url, timeout=30, allow_redirects=True)
-        
-        # Додаємо обхід простого блокування, як було в Organic Market
-        if len(r.text) < 2000 and "challenge_passed" in r.text:
-            m = re.search(r'defaultHash\s*=\s*"([a-f0-9]+)"', r.text)
-            if m:
-                scraper.cookies.set("challenge_passed", m.group(1), domain=urllib.parse.urlparse(url).netloc)
-                r = scraper.get(url, timeout=30, allow_redirects=True)
-                
+        if 'cloudscraper' in sys.modules:
+            scraper = cloudscraper.create_scraper()
+            r = scraper.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
+        else:
+             r = session.get(url, headers=REQUEST_HEADERS, timeout=25, allow_redirects=True)
         r.raise_for_status()
         r.encoding = 'utf-8'
         return BeautifulSoup(r.text, "html.parser"), r.text
-    except Exception as e:
+    except requests.RequestException as e:
         return None, str(e)
 
 def _node_cmd():
@@ -112,7 +93,6 @@ def node_available():
     return _node_cmd() is not None
 
 def decode_nuxt(script_text, log_fn=print):
-    """Оригінальний декодер Nuxt через Node.js"""
     import tempfile, os
     cmd = _node_cmd()
     if not cmd:
@@ -135,7 +115,6 @@ def decode_nuxt(script_text, log_fn=print):
     return None
 
 def _resolve_nuxt(arr, idx, depth=0):
-    """Оригінальний дереференсер для Nuxt 3 масивів (як у Eva)"""
     if depth > 30 or not isinstance(idx, int) or idx < 0 or idx >= len(arr):
         return None
     val = arr[idx]
@@ -147,169 +126,380 @@ def _resolve_nuxt(arr, idx, depth=0):
         return [_resolve_nuxt(arr, v, depth + 1) if isinstance(v, int) else v for v in val]
     return val
 
-# Універсальний пошук товарів у будь-якому складному JSON
+# ─────────────────────────────────────────────────────────
+#  1. ОРИГІНАЛЬНИЙ ПАРСЕР ЕПІЦЕНТР (З ВАШОГО АРХІВУ)
+# ─────────────────────────────────────────────────────────
+def find_epicenter_brand_url(brand, session, log_fn=print):
+    brand_slug = brand.lower().replace(" ", "-")
+    candidates = [
+        f"https://epicentrk.ua/brands/{brand_slug}.html",
+        f"https://epicentrk.ua/ua/brands/{brand_slug}.html",
+        f"https://epicentrk.ua/brands/{urllib.parse.quote(brand.lower())}.html",
+        f"https://epicentrk.ua/ua/brands/{urllib.parse.quote(brand.lower())}.html",
+    ]
+    for url in candidates:
+        try:
+            r = session.get(url, headers=REQUEST_HEADERS, timeout=15, allow_redirects=True)
+            if r.status_code == 200 and "window.__NUXT__" in r.text:
+                return r.url.split("?")[0]
+        except Exception:
+            pass
+    return None
+
+def _epicenter_page_url(brand_base, page_num, use_brand_page):
+    if page_num == 1: return brand_base
+    return f"{brand_base}?PAGEN_1={page_num}" if use_brand_page else f"{brand_base}&page={page_num}"
+
+def _parse_epicenter_products(raw_products):
+    page_products = []
+    for p in raw_products:
+        name      = p.get("name_ua") or p.get("name_ru") or ""
+        sku       = str(p.get("id") or "")
+        url_p     = p.get("url") or ""
+        price_now = p.get("price") or 0
+        price_old = p.get("price_old") or 0
+        on_discount    = bool(price_old and price_old > price_now)
+        regular_price  = str(price_old if on_discount else price_now)
+        discount_price = str(price_now) if on_discount else ""
+        avail = p.get("avail")
+        if avail == 100: in_stock = True
+        elif avail == 200: in_stock = "expected"
+        elif avail in (350, 400): in_stock = False
+        else: in_stock = None
+        seller = p.get("seller") or "Epicenter"
+        if name:
+            page_products.append({
+                "name": name, "sku": sku,
+                "price": regular_price, "on_discount": on_discount,
+                "discount_price": discount_price,
+                "url": url_p, "in_stock": in_stock, "seller": seller,
+            })
+    return page_products
+
+def _fetch_epicenter_page(page_num, brand_base, use_brand_page, session):
+    url = _epicenter_page_url(brand_base, page_num, use_brand_page)
+    soup, raw = fetch(url, session)
+    if not soup: return page_num, None
+    for script in soup.find_all("script"):
+        txt = script.string or ""
+        if "window.__NUXT__" in txt:
+            nuxt_data = decode_nuxt(txt)
+            if nuxt_data:
+                try:
+                    raw_prods = nuxt_data["state"]["products"]["products"]
+                    return page_num, _parse_epicenter_products(raw_prods)
+                except (KeyError, TypeError): pass
+    return page_num, None
+
+def scrape_epicenter(brand, session, has_node, log_fn=print, meta=None):
+    if not has_node:
+        log_fn("  ЕПІЦЕНТР: Node.js не встановлено. Парсинг неможливий.")
+        return []
+    log_fn(f"ЕПІЦЕНТР: шукаємо '{brand}'...")
+    brand_base = find_epicenter_brand_url(brand, session, log_fn)
+    if not brand_base:
+        brand_enc = requests.utils.quote(brand)
+        brand_base = f"https://epicentrk.ua/ua/search/?q={brand_enc}&per-page=60"
+    use_brand_page = "brands" in brand_base
+    soup, raw = fetch(_epicenter_page_url(brand_base, 1, use_brand_page), session)
+    if not soup: return []
+    nuxt_data = None
+    for script in soup.find_all("script"):
+        txt = script.string or ""
+        if "window.__NUXT__" in txt:
+            nuxt_data = decode_nuxt(txt, log_fn=log_fn)
+            break
+    if not nuxt_data: return []
+    try:
+        pagination  = nuxt_data["data"][0]["params"]["pagination"]
+        total_pages = pagination.get("pages", 1)
+    except (KeyError, IndexError, TypeError):
+        total_pages = 1
+    try:
+        page1_products = _parse_epicenter_products(nuxt_data["state"]["products"]["products"])
+    except (KeyError, TypeError):
+        page1_products = []
+    all_products = list(page1_products)
+    if total_pages > 1:
+        remaining = list(range(2, min(total_pages, MAX_PAGES) + 1))
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_fetch_epicenter_page, p, brand_base, use_brand_page, session): p for p in remaining}
+            page_results = {}
+            for future in as_completed(futures):
+                page_num, products = future.result()
+                page_results[page_num] = products or []
+        for p in remaining:
+            all_products.extend(page_results.get(p, []))
+    log_fn(f"  ЕПІЦЕНТР: знайдено {len(all_products)} товарів.")
+    return all_products
+
+
+# ─────────────────────────────────────────────────────────
+#  2. ОРИГІНАЛЬНИЙ ПАРСЕР EVA (З ВАШОГО АРХІВУ)
+# ─────────────────────────────────────────────────────────
+def find_eva_brand_id(brand_name, session):
+    try:
+        r = session.get("https://api.eva.ua/v1/ua/api/brands", headers={**REQUEST_HEADERS, "Accept": "application/json"}, timeout=15)
+        data = r.json()
+        for group_brands in data.get("data", {}).get("groups", {}).values():
+            for b in group_brands:
+                if b.get("title", "").lower() == brand_name.lower():
+                    m = re.search(r"brnd-(\d+)", b.get("url", ""))
+                    if m: return m.group(1), b["title"]
+    except Exception: pass
+    return None, None
+
+def parse_eva_nuxt_payload(html_text, brand_id):
+    soup = BeautifulSoup(html_text, "html.parser")
+    tag = soup.find("script", {"type": "application/json"})
+    if not tag: return None
+    try: arr = json.loads(tag.string or "")
+    except Exception: return None
+    brand_key = f"brnd-brnd-{brand_id}"
+    for el in arr:
+        if isinstance(el, dict) and brand_key in el:
+            idx = el[brand_key]
+            if isinstance(idx, int) and idx > 0:
+                return _resolve_nuxt(arr, idx)
+    return None
+
+def _parse_eva_products(brand_data):
+    page_products = []
+    for p in brand_data.get("hits", []):
+        name   = p.get("name") or ""
+        sku    = str(p.get("sku") or "")
+        price  = p.get("price") or 0
+        final  = p.get("final_price") or p.get("special_price") or price
+        on_discount    = bool(final and price and final < price)
+        regular_price  = str(price)
+        discount_price = str(final) if on_discount else ""
+        stock       = p.get("stock") or {}
+        in_stock    = stock.get("is_in_stock")
+        url_p       = f"https://eva.ua/ua/search/?q={sku}" if sku else ""
+        seller      = "EVA"
+        if name:
+            page_products.append({
+                "name": name, "sku": sku,
+                "price": regular_price, "on_discount": on_discount,
+                "discount_price": discount_price,
+                "url": url_p, "in_stock": in_stock, "seller": seller,
+            })
+    return page_products
+
+def _fetch_eva_page(page_num, base_url, brand_id, session):
+    url = f"{base_url}?p={page_num}" if page_num > 1 else base_url
+    _, raw = fetch(url, session)
+    if not raw: return page_num, None
+    brand_data = parse_eva_nuxt_payload(raw, brand_id)
+    if not brand_data: return page_num, None
+    return page_num, _parse_eva_products(brand_data)
+
+def scrape_eva(brand, session, log_fn=print, meta=None):
+    log_fn(f"EVA: шукаємо '{brand}'...")
+    brand_id, found_title = find_eva_brand_id(brand, session)
+    if not brand_id:
+        log_fn(f"  EVA: Бренд '{brand}' не знайдено.")
+        return []
+    base_url = f"https://eva.ua/ua/brnd-{brand_id}/"
+    _, raw = fetch(base_url, session)
+    if not raw: return []
+    brand_data = parse_eva_nuxt_payload(raw, brand_id)
+    if not brand_data: return []
+    site_total = brand_data.get("total")
+    page1_products = _parse_eva_products(brand_data)
+    per_page    = len(page1_products) if page1_products else 40
+    total_pages = math.ceil(int(site_total) / per_page) if site_total and per_page else 1
+    all_products = list(page1_products)
+    if total_pages > 1:
+        remaining = list(range(2, min(total_pages, MAX_PAGES) + 1))
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_fetch_eva_page, p, base_url, brand_id, session): p for p in remaining}
+            page_results = {}
+            for future in as_completed(futures):
+                page_num, products = future.result()
+                page_results[page_num] = products or []
+        for p in remaining:
+            all_products.extend(page_results.get(p, []))
+    log_fn(f"  EVA: знайдено {len(all_products)} товарів.")
+    return all_products
+
+
+# ─────────────────────────────────────────────────────────
+#  3. ОРИГІНАЛЬНИЙ ПАРСЕР ORGANIC MARKET (З ВАШОГО АРХІВУ)
+# ─────────────────────────────────────────────────────────
+def _organic_solve_challenge(session, url):
+    r = session.get(url, headers=REQUEST_HEADERS, timeout=20, allow_redirects=True)
+    if len(r.text) < 2000 and "challenge_passed" in r.text:
+        m = re.search(r'defaultHash\s*=\s*"([a-f0-9]+)"', r.text)
+        if m:
+            session.cookies.set("challenge_passed", m.group(1), domain="organic-market.com.ua")
+            r = session.get(url, headers=REQUEST_HEADERS, timeout=20, allow_redirects=True)
+    return r
+
+def find_organic_brand_url(brand, session, log_fn=print):
+    slug = brand.lower().replace(" ", "-")
+    candidates = [f"https://organic-market.com.ua/ru/{slug}/", f"https://organic-market.com.ua/ua/{slug}/"]
+    for url in candidates:
+        try:
+            r = _organic_solve_challenge(session, url)
+            if r.status_code == 200 and "catalogCard-box" in r.text:
+                return r.url
+        except Exception: pass
+    return None
+
+def _parse_organic_page(html):
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+    for card in soup.find_all("div", class_="catalogCard-box"):
+        title_a = card.find(class_="catalogCard-title")
+        if not title_a: continue
+        link = title_a.find("a")
+        if not link: continue
+        name    = link.get_text(strip=True)
+        url_p   = "https://organic-market.com.ua" + link["href"] if link.get("href", "").startswith("/") else link.get("href", "")
+        sku     = str(card.get("data-id", ""))
+        old_el  = card.find(class_="catalogCard-oldPrice")
+        new_el  = card.find(class_="catalogCard-price")
+        def parse_price(txt):
+            digits = re.sub(r"[^\d.]", "", txt.replace(",", ".").replace(" ", ""))
+            try: return float(digits)
+            except ValueError: return 0.0
+        old_price = parse_price(old_el.get_text(strip=True) if old_el else "")
+        new_price = parse_price(new_el.get_text(strip=True) if new_el else "")
+        if old_price and old_price > new_price:
+            on_discount, regular_price, discount_price = True, str(old_price), str(new_price)
+        else:
+            on_discount, regular_price, discount_price = False, str(new_price or old_price), ""
+        in_stock = bool(card.find(class_=re.compile(r"j-buy-button-add")))
+        products.append({
+            "name": name, "sku": sku, "price": regular_price, "on_discount": on_discount,
+            "discount_price": discount_price, "url": url_p, "in_stock": in_stock, "seller": "Organic Market",
+        })
+    return products
+
+def _organic_total_pages(html):
+    soup = BeautifulSoup(html, "html.parser")
+    pager = soup.find("nav", class_="pager")
+    if not pager: return 1
+    page_nums = []
+    for a in pager.find_all(class_="pager__item"):
+        try: page_nums.append(int(a.get_text(strip=True)))
+        except ValueError: pass
+    return max(page_nums) if page_nums else 1
+
+def _fetch_organic_page(page_num, brand_base, session):
+    url = brand_base if page_num == 1 else f"{brand_base.rstrip('/')}/filter/page={page_num}/"
+    try:
+        r = _organic_solve_challenge(session, url)
+        if r.status_code == 200: return page_num, _parse_organic_page(r.text)
+    except Exception: pass
+    return page_num, None
+
+def scrape_organic(brand, session, log_fn=print, meta=None):
+    log_fn(f"Organic Market: шукаємо '{brand}'...")
+    brand_base = find_organic_brand_url(brand, session, log_fn)
+    if not brand_base: return []
+    try:
+        r = _organic_solve_challenge(session, brand_base)
+        if r.status_code != 200: return []
+    except Exception: return []
+    total_pages = _organic_total_pages(r.text)
+    all_products = list(_parse_organic_page(r.text))
+    if total_pages > 1:
+        remaining = list(range(2, min(total_pages, MAX_PAGES) + 1))
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_fetch_organic_page, p, brand_base, session): p for p in remaining}
+            page_results = {}
+            for future in as_completed(futures):
+                page_num, products = future.result()
+                page_results[page_num] = products or []
+        for p in remaining:
+            all_products.extend(page_results.get(p, []))
+    log_fn(f"  Organic: знайдено {len(all_products)} товарів.")
+    return all_products
+
+
+# ─────────────────────────────────────────────────────────
+#  4. ДОДАТКОВІ ПАРСЕРИ (СІЛЬПО ТА ZAKAZ) - Схильні до блокування Cloudflare
+# ─────────────────────────────────────────────────────────
 def extract_products_from_json(node, found_products):
     if isinstance(node, dict):
-        # Ознаки товару: є ціна і назва
         if "price" in node and ("title" in node or "name" in node or "name_ua" in node):
             if "sku" in node or "id" in node or "ean" in node or "slug" in node:
-                # Уникаємо додавання дублікатів
                 sku = str(node.get("id") or node.get("sku") or node.get("ean") or node.get("slug") or "")
-                if sku and sku not in found_products:
-                    found_products[sku] = node
-        for v in node.values():
-            extract_products_from_json(v, found_products)
+                if sku and sku not in found_products: found_products[sku] = node
+        for v in node.values(): extract_products_from_json(v, found_products)
     elif isinstance(node, list):
-        for v in node:
-            extract_products_from_json(v, found_products)
-
-# ─────────────────────────────────────────────────────────
-#  ПАРСЕР СІЛЬПО (Використовує Node.js + _resolve_nuxt)
-# ─────────────────────────────────────────────────────────
+        for v in node: extract_products_from_json(v, found_products)
 
 def scrape_silpo(query, session, has_node, log_fn=print, meta=None):
-    if not has_node:
-        log_fn("  Сільпо: Node.js не знайдено! Парсинг може бути неповним.")
-
     log_fn(f"Сільпо: шукаємо '{query}'...")
     query_enc = requests.utils.quote(query)
-    
-    # Спробуємо два різні ендпоінти, які використовує Сільпо
-    urls_to_try = [
-        f"https://silpo.ua/search?find={query_enc}",
-        f"https://silpo.ua/catalog/search?search={query_enc}"
-    ]
+    url = f"https://silpo.ua/search?find={query_enc}"
+    soup, raw_text = fetch(url, session)
+    if not soup:
+        log_fn(f"  Сільпо: Помилка доступу. Блокування Cloudflare (403).")
+        return []
     
     products_data = {}
+    tag = soup.find("script", id="__NUXT_DATA__")
+    if tag:
+        try:
+            arr = json.loads(tag.string)
+            resolved = [_resolve_nuxt(arr, i) for i in range(min(15, len(arr)))]
+            extract_products_from_json(resolved, products_data)
+        except Exception: pass
     
-    for url in urls_to_try:
-        soup, raw_text = fetch(url, session)
-        if not soup:
-            log_fn(f"  Сільпо: Помилка доступу до {url} ({raw_text})")
-            continue
-            
-        # Спосіб 1: Шукаємо Nuxt 3 дані (як у Eva)
-        tag = soup.find("script", id="__NUXT_DATA__")
-        if tag:
-            try:
-                arr = json.loads(tag.string)
-                resolved = [_resolve_nuxt(arr, i) for i in range(min(15, len(arr)))]
-                extract_products_from_json(resolved, products_data)
-            except Exception as e:
-                log_fn(f"  Сільпо: Помилка __NUXT_DATA__ - {e}")
-                
-        # Спосіб 2: Якщо сайт віддав класичний Nuxt 2 (через Node.js)
-        for script in soup.find_all("script"):
-            txt = script.string or ""
-            if "window.__NUXT__" in txt:
-                nuxt_data = decode_nuxt(txt, log_fn)
-                if nuxt_data:
-                    extract_products_from_json(nuxt_data, products_data)
-
-        # Спосіб 3: Прямий парсинг HTML карток, якщо JSON заблоковано
-        for card in soup.select('.product-card, li[data-product-id]'):
-            name_el = card.select_one('.product-title, .name')
-            if not name_el: continue
-            
-            sku = card.get('data-product-id') or ""
-            price_el = card.select_one('.product-price__current, .price')
-            price_txt = price_el.text if price_el else "0"
-            price = float(re.sub(r'[^\d.]', '', price_txt.replace(',', '.')) or 0)
-            
-            if sku and sku not in products_data:
-                products_data[sku] = {"title": name_el.text.strip(), "price": price, "slug": sku, "html_parsed": True}
-
-    # Форматуємо знайдені товари
     final_products = []
     for p in products_data.values():
         name = p.get("title") or p.get("name") or p.get("name_ua") or ""
         sku = str(p.get("id") or p.get("sku") or p.get("slug") or p.get("ean") or "")
-        
         price = float(p.get("price", 0))
         old_price = float(p.get("oldPrice") or p.get("old_price") or p.get("price_old") or 0)
-        
         on_discount = old_price > price
         reg_price = old_price if on_discount else price
         disc_price = price if on_discount else 0
-        
         in_stock = str(p.get("status")) != "out_of_stock"
-        url_p = f"https://silpo.ua/product/{p.get('slug')}" if p.get("slug") else f"https://silpo.ua/search?find={query_enc}"
-        
+        url_p = f"https://silpo.ua/product/{p.get('slug')}" if p.get("slug") else url
         final_products.append({
-            "name": name, "sku": sku,
-            "price": str(reg_price), "on_discount": on_discount,
-            "discount_price": str(disc_price) if on_discount else "",
-            "url": url_p, "in_stock": in_stock, "seller": "Сільпо"
+            "name": name, "sku": sku, "price": str(reg_price), "on_discount": on_discount,
+            "discount_price": str(disc_price) if on_discount else "", "url": url_p, "in_stock": in_stock, "seller": "Сільпо"
         })
-
     log_fn(f"  Сільпо: знайдено {len(final_products)} товарів.")
     return final_products
-
-# ─────────────────────────────────────────────────────────
-#  ПАРСЕР ZAKAZ (NOVUS / VARUS)
-# ─────────────────────────────────────────────────────────
 
 def scrape_zakaz(retailer, query, session, log_fn=print, meta=None):
     log_fn(f"{retailer.title()}: шукаємо '{query}'...")
     query_enc = requests.utils.quote(query)
     base_url = f"https://{retailer}.zakaz.ua/uk/search/?q={query_enc}"
-    
     soup, raw_text = fetch(base_url, session)
     if not soup:
-        log_fn(f"  {retailer.title()}: Помилка завантаження сторінки ({raw_text})")
+        log_fn(f"  {retailer.title()}: Помилка доступу. Блокування Cloudflare (403).")
         return []
-        
     products_data = {}
-    
-    # Zakaz використовує Next.js
     script = soup.find("script", id="__NEXT_DATA__")
     if script:
         try:
             data = json.loads(script.string)
             extract_products_from_json(data, products_data)
-        except Exception as e:
-            log_fn(f"  {retailer.title()}: Помилка розбору JSON: {e}")
-            
-    # Fallback: HTML парсинг
-    if not products_data:
-        for card in soup.select('[data-testid="product-tile"]'):
-            name_el = card.select_one('[data-testid="product-tile-title"]')
-            if not name_el: continue
-            
-            price_el = card.select_one('[data-testid="product-tile-price"]')
-            price_txt = price_el.text if price_el else "0"
-            price = float(re.sub(r'[^\d.]', '', price_txt.replace(',', '.')) or 0)
-            
-            name = name_el.text.strip()
-            if name not in products_data:
-                products_data[name] = {"title": name, "price": price * 100} # Закладаємо формат копійок
-
+        except Exception: pass
     final_products = []
     for p in products_data.values():
         name = p.get("title") or p.get("name") or ""
         sku = str(p.get("ean") or p.get("id") or "")
-        
-        # Ціни в Zakaz часто в копійках
         price_raw = float(p.get("price", 0))
         if price_raw > 1000: price_raw = price_raw / 100.0
-        
         old_price_raw = float(p.get("old_price") or p.get("discount_price") or 0)
         if old_price_raw > 1000: old_price_raw = old_price_raw / 100.0
-        
         on_discount = bool(old_price_raw and old_price_raw > price_raw)
         reg_price = old_price_raw if on_discount else price_raw
         disc_price = price_raw if on_discount else 0
-        
         in_stock = p.get("in_stock", True)
         url_p = f"https://{retailer}.zakaz.ua/uk/products/{sku}/" if sku else base_url
-        
         final_products.append({
-            "name": name, "sku": sku,
-            "price": str(reg_price), "on_discount": on_discount,
-            "discount_price": str(disc_price) if on_discount else "",
-            "url": url_p, "in_stock": in_stock, "seller": retailer.title()
+            "name": name, "sku": sku, "price": str(reg_price), "on_discount": on_discount,
+            "discount_price": str(disc_price) if on_discount else "", "url": url_p, "in_stock": in_stock, "seller": retailer.title()
         })
-            
     log_fn(f"  {retailer.title()}: знайдено {len(final_products)} товарів.")
     return final_products
 
@@ -320,9 +510,8 @@ def scrape_varus(query, session, log_fn=print, meta=None):
     return scrape_zakaz("varus", query, session, log_fn, meta)
 
 # ─────────────────────────────────────────────────────────
-#  ЕКСПОРТ
+#  ЕКСПОРТ EXCEL
 # ─────────────────────────────────────────────────────────
-
 def check_data_quality(products):
     warnings = []
     for p in products:
@@ -372,14 +561,12 @@ def write_store_sheet(ws, products, store_name, query, checked_at):
         row = i + 2
         status, stock_fill = ("Є", in_fill) if p["in_stock"] else ("Немає", out_fill)
         on_disc = p.get("on_discount", False)
-        
         vals = [
             i, p.get("name", ""), p.get("sku", ""),
             _fmt_price(p.get("price", "")), "Так" if on_disc else "Ні",
             _fmt_price(p.get("discount_price", "")) if on_disc else "",
             status, p.get("seller", ""), p.get("url", "")
         ]
-        
         for ci, (val, aln) in enumerate(zip(vals, aligns), 1):
             c = ws.cell(row=row, column=ci, value=val)
             c.alignment = aln
