@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import random
+import re
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +10,7 @@ import sys
 import openpyxl
 from openpyxl.styles import Font
 
-# ДОДАНО: URL вашої Google Таблиці
+# URL вашої Google Таблиці
 SHEET_URL = "https://docs.google.com/spreadsheets/d/16OIt-2jMpLGehrYGEcv9_QpEfzvuetsleB3vJRl7rBY/edit?gid=0#gid=0"
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -69,13 +70,26 @@ def to_df(products):
 @st.cache_data(ttl=600)
 def load_config_from_gsheet(url):
     """Завантажує налаштування мереж та брендів з Google Таблиці. Кешується на 10 хвилин."""
-    # Перетворюємо звичайний URL на URL прямого експорту в CSV
-    csv_url = url.replace('/edit?gid=', '/export?format=csv&gid=')
-    if '/edit#gid=' in url:
-        csv_url = url.replace('/edit#gid=', '/export?format=csv&gid=')
-    
     try:
+        # Надійне формування посилання для експорту CSV, витягуємо ID документу
+        doc_id_match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
+        if doc_id_match:
+            doc_id = doc_id_match.group(1)
+            csv_url = f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid=0"
+        else:
+            csv_url = url
+            
         df = pd.read_csv(csv_url)
+        
+        # Видаляємо випадкові пробіли в назвах колонок (наприклад, 'TC ' -> 'TC')
+        df.columns = df.columns.str.strip()
+        
+        # Перевірка чи завантажилась правильна таблиця
+        if 'TC' not in df.columns:
+            st.error(f"❌ Помилка: Не знайдено колонку 'TC'. Знайдені колонки: `{list(df.columns)}`")
+            st.info("💡 **Підказка:** Можливо, ваша Google Таблиця закрита. Відкрийте таблицю -> Натисніть 'Поділитися' -> Змініть доступ на **'Усі, хто має посилання' (Anyone with the link)**.")
+            return pd.DataFrame()
+
         df = df.fillna("") # Замінюємо порожні значення
         return df
     except Exception as e:
@@ -92,7 +106,7 @@ with st.sidebar:
     gsheet_df = load_config_from_gsheet(SHEET_URL)
     
     if gsheet_df.empty:
-        st.error("Не вдалося завантажити дані з Google Таблиці. Перевірте доступ за посиланням.")
+        # Зупиняємо виконання, помилка вже виведена у функції вище
         st.stop()
         
     # Витягуємо унікальні мережі та бренди з колонок, ігноруючи порожні рядки
@@ -103,7 +117,8 @@ with st.sidebar:
     brand_category_map = {}
     for _, row in gsheet_df.iterrows():
         b = str(row.get('ТМ', '')).strip()
-        c = str(row.get('котегорія продукту', '')).strip() # Назва колонки взята як у вашій таблиці
+        # Використовуємо strip для назви колонки категорії
+        c = str(row.get('котегорія продукту', '')).strip() 
         if b and b not in brand_category_map:
             brand_category_map[b] = c
 
