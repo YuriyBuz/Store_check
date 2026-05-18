@@ -148,12 +148,13 @@ with st.sidebar:
 
     # Автоматично підтягуємо категорію з таблиці для обраного бренду
     auto_category = brand_category_map.get(selected_brand, "")
-    st.info(f"Категорія з таблиці: **{auto_category if auto_category else 'Не вказана'}**")
+    if auto_category:
+        st.info(f"Категорія з таблиці: **{auto_category}**")
         
     # Формуємо фінальний пошуковий запит
+    # ВАЖЛИВО: Сайти погано реагують на складні запити типу "Соус Bonsai". 
+    # Тому ми шукаємо лише за назвою бренду (як реальні користувачі).
     search_query = selected_brand
-    if auto_category:
-        search_query = f"{auto_category} {selected_brand}"
 
     st.divider()
     go = st.button("🔎  Знайти товари", type="primary", use_container_width=True)
@@ -191,12 +192,14 @@ st.write(f"### 🔍 Пошук за запитом: `{search_query}`")
 for store in selected_stores:
     with st.status(f"Сканування {store}...", expanded=True) as s:
         meta = {}
-        # Алгоритм парсингу перевіряє ім'я мережі, завантажене з таблиці
-        if store.lower() == "сільпо":
+        store_lower = store.lower()
+        
+        # Гнучка перевірка імені мережі, щоб уникнути проблем типу "Сильпо" vs "Сільпо"
+        if "сільпо" in store_lower or "сильпо" in store_lower:
             products = scrape_silpo(search_query, session, has_node, log_fn=st.write, meta=meta)
-        elif store.lower() == "novus":
+        elif "novus" in store_lower:
             products = scrape_novus(search_query, session, log_fn=st.write, meta=meta)
-        elif store.lower() == "varus":
+        elif "varus" in store_lower:
             products = scrape_varus(search_query, session, log_fn=st.write, meta=meta)
         else:
             st.warning(f"Мережа '{store}' є в таблиці, але для неї ще не підключено алгоритм сканування.")
